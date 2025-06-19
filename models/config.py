@@ -15,6 +15,7 @@ class VLMConfig:
     vit_model_type: str = 'google/siglip2-base-patch16-256'
 
     lm_hidden_dim: int = 576
+    latent_dim: int = 256
     lm_inter_dim: int = 1536
     lm_rms_eps: float = 1e-5
     lm_re_base: int = 100000

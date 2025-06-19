@@ -163,7 +163,7 @@ def apply_rotary_pos_embd(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, s
 
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L214
 # https://github.com/huggingface/smollm/blob/main/vision/m4/models/vllama3/modeling_vllama3.py#L382
-class LanguageModelGroupedQueryAttention(nn.Module):
+class LanguageModelMultiheadLatentAttention(nn.Module):
     """
     Implements Grouped Query Attention (GQA) as used in some transformer-based language models.
 
@@ -181,19 +181,20 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         super().__init__()
 
         self.n_heads = cfg.lm_n_heads
-        self.n_kv_heads = cfg.lm_n_kv_heads
+        #self.n_kv_heads = cfg.lm_n_kv_heads
         self.embd_dim = cfg.lm_hidden_dim
         self.dropout = cfg.lm_dropout
 
-        assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
+        #assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         assert self.embd_dim % self.n_heads == 0, "embd_dim must be divisible by num_heads"
 
-        self.n_kv_groups = self.n_heads // self.n_kv_heads
+        #self.n_kv_groups = self.n_heads // self.n_kv_heads
         self.head_dim = self.embd_dim // self.n_heads
 
         self.q_proj = nn.Linear(self.embd_dim, self.embd_dim, bias=False)
-        self.k_proj = nn.Linear(self.embd_dim, self.head_dim * self.n_kv_heads, bias=False)
-        self.v_proj = nn.Linear(self.embd_dim, self.head_dim * self.n_kv_heads, bias=False)
+        self.kv_down_proj = nn.Linear(self.embd_dim, cfg.latent_dim, bias=False)
+        self.k_up_proj = nn.Linear(cfg.latent_dim, self.head_dim * self.n_heads, bias=False)
+        self.v_up_proj = nn.Linear(cfg.latent_dim, self.head_dim * self.n_heads, bias=False)
         self.out_proj = nn.Linear(self.embd_dim, self.embd_dim, bias=False)
 
         self.attn_dropout = nn.Dropout(self.dropout)
@@ -224,38 +225,60 @@ class LanguageModelGroupedQueryAttention(nn.Module):
                 - Output tensor after attention and projection, shape (B, T_curr, C).
                 - Updated block_kv_cache dict for caching key-value states.
         """
+        kv_latent = self.kv_down_proj(x)
         is_prefill = block_kv_cache is None
-
         B, T_curr, C = x.size() # T_curr is the sequence length of the current input x
 
         q_curr = self.q_proj(x).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
-        k_curr = self.k_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
-        v_curr = self.v_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
 
-        # Apply rotary embeddings to the current q and k
-        q, k_rotated = apply_rotary_pos_embd(q_curr, k_curr, cos, sin)
+        k_curr = self.k_up_proj(kv_latent).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+        v_curr = self.v_up_proj(kv_latent).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+        #k_curr = self.k_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
+        #v_curr = self.v_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
 
-        # Check if we can use cached keys and values
-        if not is_prefill and block_kv_cache['key'] is not None:
-            # Concatenate with cached K, V
-            # k_rotated and v_curr are for the new token(s)
-            k = block_kv_cache['key']
-            v = block_kv_cache['value']
-            k = torch.cat([k, k_rotated], dim=2)
-            v = torch.cat([v, v_curr], dim=2)
-            block_kv_cache['key'] = k
-            block_kv_cache['value'] = v
+        if not is_prefill and block_kv_cache['latent'] is not None:
+            kv_latent_cache = block_kv_cache['latent']
+            kv_latent_full = torch.cat([kv_latent_cache, kv_latent], dim=1)
+            block_kv_cache['latent'] = kv_latent_full
         else:
-            # No cache, this is the first pass (prefill)
-            k = k_rotated
-            v = v_curr
-            block_kv_cache = {'key': k, 'value': v}
+            kv_latent_full = kv_latent
+            block_kv_cache = {'latent': kv_latent_full}
 
-        # Repeat K, V for Grouped Query Attention
-        k_exp = k.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
-        v_exp = v.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
+
+        ## Check if we can use cached keys and values
+        #if not is_prefill and block_kv_cache['key'] is not None:
+        #    # Concatenate with cached K, V
+        #    # k_rotated and v_curr are for the new token(s)
+        #    k = block_kv_cache['key']
+        #    v = block_kv_cache['value']
+        #    k = torch.cat([k, k_rotated], dim=2)
+        #    v = torch.cat([v, v_curr], dim=2)
+        #    block_kv_cache['key'] = k
+        #    block_kv_cache['value'] = v
+        #else:
+        #    # No cache, this is the first pass (prefill)
+        #    k = k_rotated
+        #    v = v_curr
+        #    block_kv_cache = {'key': k, 'value': v}
+
+        ## Repeat K, V for Grouped Query Attention
+        #k_exp = k.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
+        #v_exp = v.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
         
-        T_kv = k_exp.size(2) # Total sequence length of keys/values
+        T_kv = kv_latent_full.size(1) # Total sequence length of keys/values
+
+        k_full = self.k_up_proj(kv_latent_full).view(B, T_kv, self.n_heads, self.head_dim).transpose(1, 2)
+        v_full = self.v_up_proj(kv_latent_full).view(B, T_kv, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if not is_prefill:
+            k_curr_for_rope = k_full[:, :, -T_curr:, :]
+            q, k_curr_rotated = apply_rotary_pos_embd(q_curr, k_curr_for_rope, cos, sin)
+            k_full[:, :, -T_curr:, :] = k_curr_rotated
+            k = k_full
+        else:
+            q, k = apply_rotary_pos_embd(q_curr, k_full, cos, sin)
+
+        v = v_full
 
         # Prepare attention mask for SDPA or manual path
         # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
@@ -271,14 +294,14 @@ class LanguageModelGroupedQueryAttention(nn.Module):
             # During decode, no additional masking needed as [1, T_kv] is naturally causal
             is_causal = (T_curr == T_kv and T_curr > 1)
             y = torch.nn.functional.scaled_dot_product_attention(
-                q, k_exp, v_exp,
+                q, k, v,
                 attn_mask=additive_attn_mask, 
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=is_causal
             )
         else:
             # Manual attention implementation
-            attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
+            attn = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
             # During decode: no additional masking needed as [1, T_kv] is naturally causal
             if T_curr == T_kv and T_curr > 1:
                 causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
@@ -290,7 +313,7 @@ class LanguageModelGroupedQueryAttention(nn.Module):
 
             attn = F.softmax(attn, dim=-1)
             attn = self.attn_dropout(attn)
-            y = attn @ v_exp
+            y = attn @ v
             
         y = y.transpose(1, 2).contiguous().view(B, T_curr, C)
         y = self.out_proj(y)
@@ -352,7 +375,7 @@ class LanguageModelBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.mlp = LanguageModelMLP(cfg)
-        self.attn = LanguageModelGroupedQueryAttention(cfg)
+        self.attn = LanguageModelMultiheadLatentAttention(cfg)
         self.norm1 = RMSNorm(cfg) # Input Norm
         self.norm2 = RMSNorm(cfg) # Post Attention Norm
     
@@ -587,8 +610,12 @@ class LanguageModel(nn.Module):
             
             mapping.update({
                 f"{layer_prefix}self_attn.q_proj.weight": f"{block_prefix}attn.q_proj.weight",
-                f"{layer_prefix}self_attn.k_proj.weight": f"{block_prefix}attn.k_proj.weight",
-                f"{layer_prefix}self_attn.v_proj.weight": f"{block_prefix}attn.v_proj.weight",
+                f"{layer_prefix}self_attn.kv_down_proj.weight": f"{block_prefix}attn.kv_down_proj.weight",
+                f"{layer_prefix}self_attn.k_up_proj.weight": f"{block_prefix}attn.k_up_proj.weight",
+                f"{layer_prefix}self_attn.v_up_proj.weight": f"{block_prefix}attn.v_up_proj.weight",
+
+                #f"{layer_prefix}self_attn.k_proj.weight": f"{block_prefix}attn.k_proj.weight",
+                #f"{layer_prefix}self_attn.v_proj.weight": f"{block_prefix}attn.v_proj.weight",
                 f"{layer_prefix}self_attn.o_proj.weight": f"{block_prefix}attn.out_proj.weight",
                 f"{layer_prefix}mlp.gate_proj.weight": f"{block_prefix}mlp.gate_proj.weight",
                 f"{layer_prefix}mlp.up_proj.weight": f"{block_prefix}mlp.up_proj.weight",
