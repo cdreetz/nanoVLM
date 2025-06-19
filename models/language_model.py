@@ -181,14 +181,11 @@ class LanguageModelMultiheadLatentAttention(nn.Module):
         super().__init__()
 
         self.n_heads = cfg.lm_n_heads
-        #self.n_kv_heads = cfg.lm_n_kv_heads
         self.embd_dim = cfg.lm_hidden_dim
+        self.latent_dim = cfg.latent_dim
         self.dropout = cfg.lm_dropout
 
-        #assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         assert self.embd_dim % self.n_heads == 0, "embd_dim must be divisible by num_heads"
-
-        #self.n_kv_groups = self.n_heads // self.n_kv_heads
         self.head_dim = self.embd_dim // self.n_heads
 
         self.q_proj = nn.Linear(self.embd_dim, self.embd_dim, bias=False)
@@ -231,11 +228,7 @@ class LanguageModelMultiheadLatentAttention(nn.Module):
 
         q_curr = self.q_proj(x).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2)  # (B, n_heads, T_curr, head_dim)
 
-        k_curr = self.k_up_proj(kv_latent).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
-        v_curr = self.v_up_proj(kv_latent).view(B, T_curr, self.n_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
-        #k_curr = self.k_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
-        #v_curr = self.v_proj(x).view(B, T_curr, self.n_kv_heads, self.head_dim).transpose(1, 2) # (B, n_kv_heads, T_curr, head_dim)
-
+        # Handle KV cache in latent space
         if not is_prefill and block_kv_cache['latent'] is not None:
             kv_latent_cache = block_kv_cache['latent']
             kv_latent_full = torch.cat([kv_latent_cache, kv_latent], dim=1)
@@ -244,27 +237,6 @@ class LanguageModelMultiheadLatentAttention(nn.Module):
             kv_latent_full = kv_latent
             block_kv_cache = {'latent': kv_latent_full}
 
-
-        ## Check if we can use cached keys and values
-        #if not is_prefill and block_kv_cache['key'] is not None:
-        #    # Concatenate with cached K, V
-        #    # k_rotated and v_curr are for the new token(s)
-        #    k = block_kv_cache['key']
-        #    v = block_kv_cache['value']
-        #    k = torch.cat([k, k_rotated], dim=2)
-        #    v = torch.cat([v, v_curr], dim=2)
-        #    block_kv_cache['key'] = k
-        #    block_kv_cache['value'] = v
-        #else:
-        #    # No cache, this is the first pass (prefill)
-        #    k = k_rotated
-        #    v = v_curr
-        #    block_kv_cache = {'key': k, 'value': v}
-
-        ## Repeat K, V for Grouped Query Attention
-        #k_exp = k.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
-        #v_exp = v.repeat_interleave(self.n_kv_groups, dim=1) # (B, n_heads, T_kv, head_dim)
-        
         T_kv = kv_latent_full.size(1) # Total sequence length of keys/values
 
         k_full = self.k_up_proj(kv_latent_full).view(B, T_kv, self.n_heads, self.head_dim).transpose(1, 2)
